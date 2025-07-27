@@ -92,16 +92,21 @@ jobs:
           # 调用环境分配服务
           echo "为feature分支分配环境..."
           
-          # 使用kubectl exec调用服务
-          ALLOCATION_RESULT=$(kubectl exec -n zadig-deploy-system deployment/env-allocator -- python3 -c '
+          # 创建临时脚本文件
+          cat > /tmp/allocate.py << 'EOF'
 import urllib.request
 import json
+import sys
 import os
 
+branch = sys.argv[1] if len(sys.argv) > 1 else ""
+project = sys.argv[2] if len(sys.argv) > 2 else ""
+manual_env = sys.argv[3] if len(sys.argv) > 3 else ""
+
 data = json.dumps({
-    "branch": "'"$BRANCH_NAME"'",
-    "project": "'"$PROJECT_NAME"'",
-    "manual_env": "'"${{ github.event.inputs.manual_env }}"'"
+    "branch": branch,
+    "project": project,
+    "manual_env": manual_env
 }).encode("utf-8")
 
 try:
@@ -115,7 +120,11 @@ try:
     print(result)
 except Exception as e:
     print(f"Error: {e}")
-')
+EOF
+          
+          # 使用kubectl cp复制脚本并执行
+          kubectl cp /tmp/allocate.py zadig-deploy-system/$(kubectl get pods -n zadig-deploy-system -l app=env-allocator -o jsonpath='{.items[0].metadata.name}'):/tmp/allocate.py
+          ALLOCATION_RESULT=$(kubectl exec -n zadig-deploy-system deployment/env-allocator -- python3 /tmp/allocate.py "$BRANCH_NAME" "$PROJECT_NAME" "${{ github.event.inputs.manual_env }}")
           
           ENV_NAME=$(echo "$ALLOCATION_RESULT" | grep -o '"environment":"[^"]*"' | cut -d'"' -f4)
           
@@ -213,11 +222,16 @@ EOF
         ENV_NAME="${{ steps.allocate-env.outputs.environment }}"
         if [[ "$ENV_NAME" != "test17" ]] && [[ "$ENV_NAME" != "test33" ]]; then
           echo "部署失败，释放环境: $ENV_NAME"
-          kubectl exec -n zadig-deploy-system deployment/env-allocator -- python3 -c '
+          
+          # 创建释放脚本
+          cat > /tmp/release.py << 'EOF'
 import urllib.request
 import json
+import sys
 
-data = json.dumps({"environment": "'"$ENV_NAME"'"}).encode("utf-8")
+env_name = sys.argv[1] if len(sys.argv) > 1 else ""
+
+data = json.dumps({"environment": env_name}).encode("utf-8")
 
 try:
     req = urllib.request.Request(
@@ -229,5 +243,8 @@ try:
     print(response.read().decode())
 except Exception as e:
     print(f"Error: {e}")
-'
+EOF
+          
+          kubectl cp /tmp/release.py zadig-deploy-system/$(kubectl get pods -n zadig-deploy-system -l app=env-allocator -o jsonpath='{.items[0].metadata.name}'):/tmp/release.py
+          kubectl exec -n zadig-deploy-system deployment/env-allocator -- python3 /tmp/release.py "$ENV_NAME"
         fi
