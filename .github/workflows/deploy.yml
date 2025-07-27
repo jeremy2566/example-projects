@@ -47,7 +47,7 @@ jobs:
     
     - name: 验证集群连接
       run: |
-        kubectl version --short
+        kubectl version --client
         kubectl get nodes
     
     - name: 检测变更的服务
@@ -92,18 +92,29 @@ jobs:
           # 调用环境分配服务
           echo "为feature分支分配环境..."
           
-          # 创建临时Pod来调用服务
-          ALLOCATION_RESULT=$(kubectl run allocate-env-$RANDOM \
-            --image=curlimages/curl:latest \
-            --rm -i --restart=Never \
-            -n zadig-deploy-system -- \
-            curl -s -X POST http://env-allocator.zadig-deploy-system.svc.cluster.local/allocate \
-            -H "Content-Type: application/json" \
-            -d "{
-              \"branch\": \"$BRANCH_NAME\",
-              \"project\": \"$PROJECT_NAME\",
-              \"manual_env\": \"${{ github.event.inputs.manual_env }}\"
-            }")
+          # 使用kubectl exec调用服务
+          ALLOCATION_RESULT=$(kubectl exec -n zadig-deploy-system deployment/env-allocator -- python3 -c "
+import urllib.request
+import json
+
+data = json.dumps({
+    'branch': '$BRANCH_NAME',
+    'project': '$PROJECT_NAME',
+    'manual_env': '${{ github.event.inputs.manual_env }}'
+}).encode('utf-8')
+
+try:
+    req = urllib.request.Request(
+        'http://localhost:5000/allocate',
+        data=data,
+        headers={'Content-Type': 'application/json'}
+    )
+    response = urllib.request.urlopen(req)
+    result = response.read().decode()
+    print(result)
+except Exception as e:
+    print(f'Error: {e}')
+")
           
           ENV_NAME=$(echo "$ALLOCATION_RESULT" | grep -o '"environment":"[^"]*"' | cut -d'"' -f4)
           
@@ -201,11 +212,21 @@ EOF
         ENV_NAME="${{ steps.allocate-env.outputs.environment }}"
         if [[ "$ENV_NAME" != "test17" ]] && [[ "$ENV_NAME" != "test33" ]]; then
           echo "部署失败，释放环境: $ENV_NAME"
-          kubectl run release-env-$RANDOM \
-            --image=curlimages/curl:latest \
-            --rm -i --restart=Never \
-            -n zadig-deploy-system -- \
-            curl -s -X POST http://env-allocator.zadig-deploy-system.svc.cluster.local/release \
-            -H "Content-Type: application/json" \
-            -d "{\"environment\": \"$ENV_NAME\"}"
+          kubectl exec -n zadig-deploy-system deployment/env-allocator -- python3 -c "
+import urllib.request
+import json
+
+data = json.dumps({'environment': '$ENV_NAME'}).encode('utf-8')
+
+try:
+    req = urllib.request.Request(
+        'http://localhost:5000/release',
+        data=data,
+        headers={'Content-Type': 'application/json'}
+    )
+    response = urllib.request.urlopen(req)
+    print(response.read().decode())
+except Exception as e:
+    print(f'Error: {e}')
+"
         fi
