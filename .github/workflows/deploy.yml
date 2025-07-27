@@ -1,0 +1,211 @@
+name: 一键部署到测试环境
+
+on:
+  push:
+    branches:
+      - 'feature/**'
+      - 'release/**'
+      - 'master'
+  workflow_dispatch:
+    inputs:
+      manual_env:
+        description: '手动指定环境 (例如: test05)'
+        required: false
+        type: string
+      services:
+        description: '要部署的服务 (逗号分隔，留空部署所有)'
+        required: false
+        type: string
+        default: ''
+
+env:
+  AWS_REGION: ap-southeast-1
+
+jobs:
+  deploy:
+    name: 部署到测试环境
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: 检出代码
+      uses: actions/checkout@v3
+      with:
+        fetch-depth: 2
+    
+    - name: 设置AWS凭证
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+    
+    - name: 设置Kubeconfig
+      run: |
+        mkdir -p $HOME/.kube
+        echo "${{ secrets.KUBECONFIG }}" | base64 -d > $HOME/.kube/config
+        chmod 600 $HOME/.kube/config
+    
+    - name: 验证集群连接
+      run: |
+        kubectl version --short
+        kubectl get nodes
+    
+    - name: 检测变更的服务
+      id: detect-services
+      run: |
+        if [[ -n "${{ github.event.inputs.services }}" ]]; then
+          echo "使用手动指定的服务: ${{ github.event.inputs.services }}"
+          echo "services=${{ github.event.inputs.services }}" >> $GITHUB_OUTPUT
+        elif [[ "${{ github.ref }}" == "refs/heads/master" ]] || [[ "${{ github.ref }}" == refs/heads/release/* ]]; then
+          echo "master/release分支，部署所有服务"
+          echo "services=all" >> $GITHUB_OUTPUT
+        else
+          # 检测实际变更的服务
+          changed_services=$(git diff --name-only HEAD~1 HEAD | grep -E "^services/([^/]+)/" | cut -d'/' -f2 | sort -u | tr '\n' ',')
+          changed_services=${changed_services%,}
+          
+          if [[ -z "$changed_services" ]]; then
+            echo "未检测到服务变更"
+            echo "services=none" >> $GITHUB_OUTPUT
+          else
+            echo "检测到变更的服务: $changed_services"
+            echo "services=$changed_services" >> $GITHUB_OUTPUT
+          fi
+        fi
+    
+    - name: 分配测试环境
+      id: allocate-env
+      if: steps.detect-services.outputs.services != 'none'
+      run: |
+        # 提取分支名和项目名
+        BRANCH_NAME="${GITHUB_REF#refs/heads/}"
+        PROJECT_NAME="${{ github.repository }}"
+        
+        # 检查是否需要使用特定环境
+        if [[ "$BRANCH_NAME" == "master" ]]; then
+          ENV_NAME="test33"
+          echo "使用master专用环境: $ENV_NAME"
+        elif [[ "$BRANCH_NAME" == release/* ]]; then
+          ENV_NAME="test17"
+          echo "使用release专用环境: $ENV_NAME"
+        else
+          # 调用环境分配服务
+          echo "为feature分支分配环境..."
+          
+          # 创建临时Pod来调用服务
+          ALLOCATION_RESULT=$(kubectl run allocate-env-$RANDOM \
+            --image=curlimages/curl:latest \
+            --rm -i --restart=Never \
+            -n zadig-deploy-system -- \
+            curl -s -X POST http://env-allocator.zadig-deploy-system.svc.cluster.local/allocate \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"branch\": \"$BRANCH_NAME\",
+              \"project\": \"$PROJECT_NAME\",
+              \"manual_env\": \"${{ github.event.inputs.manual_env }}\"
+            }")
+          
+          ENV_NAME=$(echo "$ALLOCATION_RESULT" | grep -o '"environment":"[^"]*"' | cut -d'"' -f4)
+          
+          if [[ -z "$ENV_NAME" ]]; then
+            echo "环境分配失败: $ALLOCATION_RESULT"
+            exit 1
+          fi
+        fi
+        
+        echo "environment=$ENV_NAME" >> $GITHUB_OUTPUT
+        echo "✅ 分配的环境: $ENV_NAME"
+    
+    - name: 部署服务到测试环境
+      if: steps.detect-services.outputs.services != 'none'
+      env:
+        TARGET_ENV: ${{ steps.allocate-env.outputs.environment }}
+        SERVICES: ${{ steps.detect-services.outputs.services }}
+      run: |
+        echo "🚀 开始部署到环境: $TARGET_ENV"
+        echo "📦 部署的服务: $SERVICES"
+        
+        # 确保目标命名空间存在
+        if ! kubectl get namespace $TARGET_ENV &>/dev/null; then
+          echo "创建命名空间: $TARGET_ENV"
+          kubectl create namespace $TARGET_ENV
+          kubectl label namespace $TARGET_ENV environment=$TARGET_ENV managed-by=github-actions
+        fi
+        
+        # 部署示例服务（实际项目中替换为真实的部署逻辑）
+        if [[ "$SERVICES" == "all" ]] || [[ "$SERVICES" == *"api-gateway"* ]]; then
+          echo "部署 api-gateway..."
+          kubectl apply -f - <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-gateway
+  namespace: $TARGET_ENV
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: api-gateway
+  template:
+    metadata:
+      labels:
+        app: api-gateway
+    spec:
+      containers:
+      - name: api-gateway
+        image: nginx:alpine
+        ports:
+        - containerPort: 80
+        env:
+        - name: ENV_NAME
+          value: "$TARGET_ENV"
+        - name: DEPLOYED_AT
+          value: "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        - name: DEPLOYED_BY
+          value: "GitHub Actions"
+        - name: BRANCH
+          value: "${GITHUB_REF#refs/heads/}"
+EOF
+        fi
+        
+        # 等待部署完成
+        kubectl rollout status deployment/api-gateway -n $TARGET_ENV --timeout=300s || true
+    
+    - name: 输出访问信息
+      if: steps.detect-services.outputs.services != 'none'
+      run: |
+        ENV_NAME="${{ steps.allocate-env.outputs.environment }}"
+        echo "================================================"
+        echo "✅ 部署完成！"
+        echo "================================================"
+        echo ""
+        echo "🌍 环境: $ENV_NAME"
+        echo "🔗 访问地址: https://your-domain.com (使用Header: x-test-env: $ENV_NAME)"
+        echo "📊 查看部署状态:"
+        echo "   kubectl get pods -n $ENV_NAME"
+        echo ""
+        echo "🧹 完成测试后释放环境:"
+        echo "   curl -X POST http://env-allocator/release -d '{\"environment\": \"$ENV_NAME\"}'"
+        echo ""
+        
+        # 添加GitHub部署状态
+        echo "### 🚀 部署成功到 $ENV_NAME" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "- **分支**: ${GITHUB_REF#refs/heads/}" >> $GITHUB_STEP_SUMMARY
+        echo "- **服务**: ${{ steps.detect-services.outputs.services }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **时间**: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_STEP_SUMMARY
+    
+    - name: 清理失败的环境（如果需要）
+      if: failure() && steps.allocate-env.outputs.environment != ''
+      run: |
+        ENV_NAME="${{ steps.allocate-env.outputs.environment }}"
+        if [[ "$ENV_NAME" != "test17" ]] && [[ "$ENV_NAME" != "test33" ]]; then
+          echo "部署失败，释放环境: $ENV_NAME"
+          kubectl run release-env-$RANDOM \
+            --image=curlimages/curl:latest \
+            --rm -i --restart=Never \
+            -n zadig-deploy-system -- \
+            curl -s -X POST http://env-allocator.zadig-deploy-system.svc.cluster.local/release \
+            -H "Content-Type: application/json" \
+            -d "{\"environment\": \"$ENV_NAME\"}"
+        fi
