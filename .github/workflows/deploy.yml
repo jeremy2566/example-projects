@@ -38,6 +38,7 @@ jobs:
         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: ${{ env.AWS_REGION }}
+      continue-on-error: true
     
     - name: 设置Kubeconfig
       run: |
@@ -60,7 +61,6 @@ jobs:
           echo "master/release分支，部署所有服务"
           echo "services=all" >> $GITHUB_OUTPUT
         else
-          # 检测实际变更的服务
           changed_services=$(git diff --name-only HEAD~1 HEAD | grep -E "^services/([^/]+)/" | cut -d'/' -f2 | sort -u | tr '\n' ',')
           changed_services=${changed_services%,}
           
@@ -77,11 +77,9 @@ jobs:
       id: allocate-env
       if: steps.detect-services.outputs.services != 'none'
       run: |
-        # 提取分支名和项目名
         BRANCH_NAME="${GITHUB_REF#refs/heads/}"
         PROJECT_NAME="${{ github.repository }}"
         
-        # 检查是否需要使用特定环境
         if [[ "$BRANCH_NAME" == "master" ]]; then
           ENV_NAME="test33"
           echo "使用master专用环境: $ENV_NAME"
@@ -89,42 +87,18 @@ jobs:
           ENV_NAME="test17"
           echo "使用release专用环境: $ENV_NAME"
         else
-          # 调用环境分配服务
           echo "为feature分支分配环境..."
           
-          # 创建临时脚本文件
-          cat > /tmp/allocate.py << 'EOF'
-import urllib.request
-import json
-import sys
-import os
-
-branch = sys.argv[1] if len(sys.argv) > 1 else ""
-project = sys.argv[2] if len(sys.argv) > 2 else ""
-manual_env = sys.argv[3] if len(sys.argv) > 3 else ""
-
-data = json.dumps({
-    "branch": branch,
-    "project": project,
-    "manual_env": manual_env
-}).encode("utf-8")
-
-try:
-    req = urllib.request.Request(
-        "http://localhost:5000/allocate",
-        data=data,
-        headers={"Content-Type": "application/json"}
-    )
-    response = urllib.request.urlopen(req)
-    result = response.read().decode()
-    print(result)
-except Exception as e:
-    print(f"Error: {e}")
-EOF
+          # 使用简单的curl命令通过port-forward
+          kubectl port-forward -n zadig-deploy-system svc/env-allocator 8080:80 &
+          PORT_FORWARD_PID=$!
+          sleep 5
           
-          # 使用kubectl cp复制脚本并执行
-          kubectl cp /tmp/allocate.py zadig-deploy-system/$(kubectl get pods -n zadig-deploy-system -l app=env-allocator -o jsonpath='{.items[0].metadata.name}'):/tmp/allocate.py
-          ALLOCATION_RESULT=$(kubectl exec -n zadig-deploy-system deployment/env-allocator -- python3 /tmp/allocate.py "$BRANCH_NAME" "$PROJECT_NAME" "${{ github.event.inputs.manual_env }}")
+          ALLOCATION_RESULT=$(curl -s -X POST http://localhost:8080/allocate \
+            -H "Content-Type: application/json" \
+            -d "{\"branch\": \"$BRANCH_NAME\", \"project\": \"$PROJECT_NAME\", \"manual_env\": \"${{ github.event.inputs.manual_env }}\"}")
+          
+          kill $PORT_FORWARD_PID || true
           
           ENV_NAME=$(echo "$ALLOCATION_RESULT" | grep -o '"environment":"[^"]*"' | cut -d'"' -f4)
           
@@ -146,50 +120,59 @@ EOF
         echo "🚀 开始部署到环境: $TARGET_ENV"
         echo "📦 部署的服务: $SERVICES"
         
-        # 确保目标命名空间存在
         if ! kubectl get namespace $TARGET_ENV &>/dev/null; then
           echo "创建命名空间: $TARGET_ENV"
           kubectl create namespace $TARGET_ENV
           kubectl label namespace $TARGET_ENV environment=$TARGET_ENV managed-by=github-actions
         fi
         
-        # 部署示例服务（实际项目中替换为真实的部署逻辑）
         if [[ "$SERVICES" == "all" ]] || [[ "$SERVICES" == *"api-gateway"* ]]; then
           echo "部署 api-gateway..."
           kubectl apply -f - <<EOF
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: api-gateway
-  namespace: $TARGET_ENV
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: api-gateway
-  template:
-    metadata:
-      labels:
-        app: api-gateway
-    spec:
-      containers:
-      - name: api-gateway
-        image: nginx:alpine
-        ports:
-        - containerPort: 80
-        env:
-        - name: ENV_NAME
-          value: "$TARGET_ENV"
-        - name: DEPLOYED_AT
-          value: "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        - name: DEPLOYED_BY
-          value: "GitHub Actions"
-        - name: BRANCH
-          value: "${GITHUB_REF#refs/heads/}"
-EOF
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: api-gateway
+          namespace: $TARGET_ENV
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: api-gateway
+          template:
+            metadata:
+              labels:
+                app: api-gateway
+            spec:
+              containers:
+              - name: api-gateway
+                image: nginx:alpine
+                ports:
+                - containerPort: 80
+                env:
+                - name: ENV_NAME
+                  value: "$TARGET_ENV"
+                - name: DEPLOYED_AT
+                  value: "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+                - name: DEPLOYED_BY
+                  value: "GitHub Actions"
+                - name: BRANCH
+                  value: "${GITHUB_REF#refs/heads/}"
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: api-gateway
+          namespace: $TARGET_ENV
+        spec:
+          selector:
+            app: api-gateway
+          ports:
+          - port: 80
+            targetPort: 80
+        EOF
         fi
         
-        # 等待部署完成
         kubectl rollout status deployment/api-gateway -n $TARGET_ENV --timeout=300s || true
     
     - name: 输出访问信息
@@ -209,42 +192,26 @@ EOF
         echo "   curl -X POST http://env-allocator/release -d '{\"environment\": \"$ENV_NAME\"}'"
         echo ""
         
-        # 添加GitHub部署状态
         echo "### 🚀 部署成功到 $ENV_NAME" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
         echo "- **分支**: ${GITHUB_REF#refs/heads/}" >> $GITHUB_STEP_SUMMARY
         echo "- **服务**: ${{ steps.detect-services.outputs.services }}" >> $GITHUB_STEP_SUMMARY
         echo "- **时间**: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_STEP_SUMMARY
     
-    - name: 清理失败的环境（如果需要）
+    - name: 清理失败的环境
       if: failure() && steps.allocate-env.outputs.environment != ''
       run: |
         ENV_NAME="${{ steps.allocate-env.outputs.environment }}"
         if [[ "$ENV_NAME" != "test17" ]] && [[ "$ENV_NAME" != "test33" ]]; then
           echo "部署失败，释放环境: $ENV_NAME"
           
-          # 创建释放脚本
-          cat > /tmp/release.py << 'EOF'
-import urllib.request
-import json
-import sys
-
-env_name = sys.argv[1] if len(sys.argv) > 1 else ""
-
-data = json.dumps({"environment": env_name}).encode("utf-8")
-
-try:
-    req = urllib.request.Request(
-        "http://localhost:5000/release",
-        data=data,
-        headers={"Content-Type": "application/json"}
-    )
-    response = urllib.request.urlopen(req)
-    print(response.read().decode())
-except Exception as e:
-    print(f"Error: {e}")
-EOF
+          kubectl port-forward -n zadig-deploy-system svc/env-allocator 8080:80 &
+          PORT_FORWARD_PID=$!
+          sleep 5
           
-          kubectl cp /tmp/release.py zadig-deploy-system/$(kubectl get pods -n zadig-deploy-system -l app=env-allocator -o jsonpath='{.items[0].metadata.name}'):/tmp/release.py
-          kubectl exec -n zadig-deploy-system deployment/env-allocator -- python3 /tmp/release.py "$ENV_NAME"
+          curl -s -X POST http://localhost:8080/release \
+            -H "Content-Type: application/json" \
+            -d "{\"environment\": \"$ENV_NAME\"}"
+          
+          kill $PORT_FORWARD_PID || true
         fi
