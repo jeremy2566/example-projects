@@ -93,28 +93,29 @@ jobs:
           echo "为feature分支分配环境..."
           
           # 使用kubectl exec调用服务
-          ALLOCATION_RESULT=$(kubectl exec -n zadig-deploy-system deployment/env-allocator -- python3 -c "
+          ALLOCATION_RESULT=$(kubectl exec -n zadig-deploy-system deployment/env-allocator -- python3 -c '
 import urllib.request
 import json
+import os
 
 data = json.dumps({
-    'branch': '$BRANCH_NAME',
-    'project': '$PROJECT_NAME',
-    'manual_env': '${{ github.event.inputs.manual_env }}'
-}).encode('utf-8')
+    "branch": "'"$BRANCH_NAME"'",
+    "project": "'"$PROJECT_NAME"'",
+    "manual_env": "'"${{ github.event.inputs.manual_env }}"'"
+}).encode("utf-8")
 
 try:
     req = urllib.request.Request(
-        'http://localhost:5000/allocate',
+        "http://localhost:5000/allocate",
         data=data,
-        headers={'Content-Type': 'application/json'}
+        headers={"Content-Type": "application/json"}
     )
     response = urllib.request.urlopen(req)
     result = response.read().decode()
     print(result)
 except Exception as e:
-    print(f'Error: {e}')
-")
+    print(f"Error: {e}")
+')
           
           ENV_NAME=$(echo "$ALLOCATION_RESULT" | grep -o '"environment":"[^"]*"' | cut -d'"' -f4)
           
@@ -212,21 +213,21 @@ EOF
         ENV_NAME="${{ steps.allocate-env.outputs.environment }}"
         if [[ "$ENV_NAME" != "test17" ]] && [[ "$ENV_NAME" != "test33" ]]; then
           echo "部署失败，释放环境: $ENV_NAME"
-          kubectl exec -n zadig-deploy-system deployment/env-allocator -- python3 -c "
+          kubectl exec -n zadig-deploy-system deployment/env-allocator -- python3 -c '
 import urllib.request
 import json
 
-data = json.dumps({'environment': '$ENV_NAME'}).encode('utf-8')
+data = json.dumps({"environment": "'"$ENV_NAME"'"}).encode("utf-8")
 
 try:
     req = urllib.request.Request(
-        'http://localhost:5000/release',
+        "http://localhost:5000/release",
         data=data,
-        headers={'Content-Type': 'application/json'}
+        headers={"Content-Type": "application/json"}
     )
     response = urllib.request.urlopen(req)
     print(response.read().decode())
 except Exception as e:
-    print(f'Error: {e}')
-"
+    print(f"Error: {e}")
+'
         fi
